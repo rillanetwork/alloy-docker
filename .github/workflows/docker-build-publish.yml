@@ -1,0 +1,155 @@
+name: Build and Push Docker Image
+
+on:
+  push:
+    branches:
+      - main
+      - master
+    tags:
+      - "v*"
+  pull_request:
+    branches:
+      - main
+      - master
+  schedule:
+    - cron: '0 6 * * *' # Daily at 6am UTC — check for upstream Alloy updates
+  workflow_dispatch:
+    inputs:
+      rebuild_tag:
+        description: 'Upstream Alloy tag to rebuild (optional, overrides auto-detect)'
+        required: false
+        default: ''
+
+env:
+  AWS_REGION: ap-southeast-2
+  ECR_REGISTRY: 024848479928.dkr.ecr.ap-southeast-2.amazonaws.com
+  ECR_REPOSITORY: rilla-alloy-custom
+
+jobs:
+  check-upstream:
+    if: github.event_name == 'schedule' || github.event.inputs.rebuild_tag != ''
+    runs-on: ubuntu-latest
+    outputs:
+      should_build: ${{ steps.compare.outputs.should_build }}
+      alloy_tag: ${{ steps.get_tag.outputs.tag }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Get latest upstream tag
+        id: get_tag
+        run: |
+          if [ -n "${{ github.event.inputs.rebuild_tag }}" ]; then
+            echo "tag=${{ github.event.inputs.rebuild_tag }}" >> $GITHUB_OUTPUT
+          else
+            latest_tag=$(curl -s "https://registry.hub.docker.com/v2/repositories/grafana/alloy/tags?page_size=100" \
+              | jq -r '.results[].name' \
+              | grep -E '^v?[0-9]+(\.[0-9]+)*$' \
+              | grep -v '-' \
+              | sort -V \
+              | tail -n1)
+            echo "tag=$latest_tag" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Read last built tag
+        id: last_tag
+        run: |
+          echo "LAST_TAG=$(cat .last_built_tag 2>/dev/null || echo 'none')" >> $GITHUB_ENV
+
+      - name: Compare tags
+        id: compare
+        run: |
+          if [ -n "${{ github.event.inputs.rebuild_tag }}" ]; then
+            echo "should_build=true" >> $GITHUB_OUTPUT
+          elif [ "${{ steps.get_tag.outputs.tag }}" != "${{ env.LAST_TAG }}" ]; then
+            echo "should_build=true" >> $GITHUB_OUTPUT
+          else
+            echo "should_build=false" >> $GITHUB_OUTPUT
+          fi
+
+  build-and-push:
+    runs-on: ubuntu-latest
+    needs: [check-upstream]
+    if: |
+      always() &&
+      (needs.check-upstream.result == 'skipped' ||
+       needs.check-upstream.outputs.should_build == 'true')
+    permissions:
+      contents: write
+      id-token: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Determine Alloy build tag
+        id: alloy_tag
+        run: |
+          if [ "${{ github.event_name }}" = "schedule" ] || [ -n "${{ github.event.inputs.rebuild_tag }}" ]; then
+            echo "tag=${{ needs.check-upstream.outputs.alloy_tag }}" >> $GITHUB_OUTPUT
+          else
+            # For push/PR events, use the tag from .last_built_tag or default to latest
+            echo "tag=$(cat .last_built_tag 2>/dev/null || echo 'latest')" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          role-session-name: gh-actions
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Log in to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Extract metadata (tags, labels) for Docker
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+            type=sha
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=raw,value=${{ steps.alloy_tag.outputs.tag }},enable=${{ github.event_name == 'schedule' || github.event.inputs.rebuild_tag != '' }}
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            ALLOY_TAG=${{ steps.alloy_tag.outputs.tag }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Output image tags
+        if: github.event_name != 'pull_request'
+        run: |
+          echo "Image tags:"
+          echo "${{ steps.meta.outputs.tags }}"
+
+      - name: Update last built tag
+        if: github.event_name == 'schedule' || github.event.inputs.rebuild_tag != ''
+        run: echo "${{ steps.alloy_tag.outputs.tag }}" > .last_built_tag
+
+      - name: Commit and push .last_built_tag
+        if: github.event_name == 'schedule' || github.event.inputs.rebuild_tag != ''
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: "Update last built tag to ${{ steps.alloy_tag.outputs.tag }}"
+          file_pattern: .last_built_tag

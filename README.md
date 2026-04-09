@@ -54,7 +54,3 @@ docker run --rm -it my-alloy:local
 
 - Edit `alloy-config.yaml` to change the configuration.
 - Edit the Dockerfile if you need to change the config path or add more files.
-
-## License
-
-MIT
